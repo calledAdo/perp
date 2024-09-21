@@ -1,0 +1,17 @@
+{
+  "canisters": {
+    "Perpic_backend": {
+      "candid": "src/Perpic_backend/Perpic_backend.did",
+      "package": "Perpic_backend",
+      "type": "rust"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
