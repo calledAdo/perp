@@ -1,0 +1,4 @@
+service : {
+  close_position : () -> (nat);
+  open_position : (nat, opt nat64, nat8, bool) -> ();
+}

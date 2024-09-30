@@ -1,8 +1,13 @@
 {
   "canisters": {
-    "Perpic_backend": {
-      "candid": "src/Perpic_backend/Perpic_backend.did",
-      "package": "Perpic_backend",
+    "perp": {
+      "candid": "src/perp/perp.did",
+      "package": "perp",
+      "type": "rust"
+    },
+    "store": {
+      "candid": "src/store/store.did",
+      "package": "store",
       "type": "rust"
     }
   },
