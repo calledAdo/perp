@@ -1,4 +1,4 @@
-use crate::corelib::calc_lib::{_calc_shares, _calc_shares_value};
+use crate::corelib::calc_lib::{_calc_shares, _calc_shares_value, _percentage128};
 use candid::{CandidType, Decode, Encode, Principal};
 use ic_stable_structures::{storable::BoundedStorable, Storable};
 
@@ -6,13 +6,128 @@ use serde::Deserialize;
 use std::borrow::Cow;
 pub type Tick = u64;
 pub type Amount = u128;
-type Time = u64;
+
+/// The enum defining the different asset classes.
+#[derive(CandidType, Clone, Debug, Deserialize, PartialEq)]
+pub enum AssetClass {
+    /// The cryptocurrency asset class.
+    Cryptocurrency,
+    /// The fiat currency asset class.
+    FiatCurrency,
+}
+
+/// Exchange rates are derived for pairs of assets captured in this struct.
+#[derive(CandidType, Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Asset {
+    /// The symbol/code of the asset.
+    pub symbol: String,
+    /// The asset class.
+    pub class: AssetClass,
+}
+
+/// The type the user sends when requesting a rate.
+///
+/// For definitions of "base", "quote", etc, the reader is referred to
+/// https://en.wikipedia.org/wiki/Currency_pair.
+#[derive(CandidType, Clone, Debug, Deserialize)]
+pub struct GetExchangeRateRequest {
+    /// The base asset, i.e., the first asset in a currency pair. For example,
+    /// ICP is the base asset in the currency pair ICP/USD.
+    pub base_asset: Asset,
+    /// The quote asset, i.e., the second asset in a currency pair. For example,
+    /// USD is the quote asset in the currency pair ICP/USD.
+    pub quote_asset: Asset,
+    /// An optional parameter used to find a rate at a specific time.
+    pub timestamp: Option<u64>,
+}
+
+/// Metadata information to give background on how the rate was determined.
+#[derive(CandidType, Clone, Debug, Deserialize, PartialEq)]
+pub struct ExchangeRateMetadata {
+    /// The scaling factor for the exchange rate and the standard deviation.
+    pub decimals: u32,
+    /// The number of queried exchanges for the base asset.
+    pub base_asset_num_queried_sources: usize,
+    /// The number of rates successfully received from the queried sources for the base asset.
+    pub base_asset_num_received_rates: usize,
+    /// The number of queried exchanges for the quote asset.
+    pub quote_asset_num_queried_sources: usize,
+    /// The number of rates successfully received from the queried sources for the quote asset.
+    pub quote_asset_num_received_rates: usize,
+    /// The standard deviation of the received rates, scaled by the factor `10^decimals`.
+    pub standard_deviation: u64,
+    /// The timestamp of the beginning of the day for which the forex rates were retrieved, if any.
+    pub forex_timestamp: Option<u64>,
+}
+
+/// When a rate is determined, this struct is used to present the information
+/// to the user.
+#[derive(CandidType, Clone, Debug, Deserialize, PartialEq)]
+pub struct ExchangeRate {
+    /// The base asset.
+    pub base_asset: Asset,
+    /// The quote asset.
+    pub quote_asset: Asset,
+    /// The timestamp associated with the returned rate.
+    pub timestamp: u64,
+    /// The median rate from the received rates, scaled by the factor `10^decimals` in the metadata.
+    pub rate: u64,
+    /// Metadata providing additional information about the exchange rate calculation.
+    pub metadata: ExchangeRateMetadata,
+}
+
+/// Returned to the user when something goes wrong retrieving the exchange rate.
+#[derive(CandidType, Clone, Debug, Deserialize)]
+pub enum ExchangeRateError {
+    /// Returned when the canister receives a call from the anonymous principal.
+    AnonymousPrincipalNotAllowed,
+    /// Returned when the canister is in process of retrieving a rate from an exchange.
+    Pending,
+    /// Returned when the base asset rates are not found from the exchanges HTTP outcalls.
+    CryptoBaseAssetNotFound,
+    /// Returned when the quote asset rates are not found from the exchanges HTTP outcalls.
+    CryptoQuoteAssetNotFound,
+    /// Returned when the stablecoin rates are not found from the exchanges HTTP outcalls needed for computing a crypto/fiat pair.
+    StablecoinRateNotFound,
+    /// Returned when there are not enough stablecoin rates to determine the forex/USDT rate.
+    StablecoinRateTooFewRates,
+    /// Returned when the stablecoin rate is zero.
+    StablecoinRateZeroRate,
+    /// Returned when a rate for the provided forex asset could not be found at the provided timestamp.
+    ForexInvalidTimestamp,
+    /// Returned when the forex base asset is found.
+    ForexBaseAssetNotFound,
+    /// Returned when the forex quote asset is found.
+    ForexQuoteAssetNotFound,
+    /// Returned when neither forex asset is found.
+    ForexAssetsNotFound,
+    /// Returned when the caller is not the CMC and there are too many active requests.
+    RateLimited,
+    /// Returned when the caller does not send enough cycles to make a request.
+    NotEnoughCycles,
+    /// Returned if too many collected rates deviate substantially.
+    InconsistentRatesReceived,
+    /// Until candid bug is fixed, new errors after launch will be placed here.
+    Other(OtherError),
+}
+
+/// Used to provide details for the [ExchangeRateError::Other] variant field.
+#[derive(CandidType, Clone, Debug, Deserialize)]
+pub struct OtherError {
+    /// The identifier for the error that occurred.
+    pub code: u32,
+    /// A description of the error that occurred.
+    pub description: String,
+}
+
+/// Short-hand for returning the result of a `get_exchange_rate` request.
+pub type GetExchangeRateResult = Result<ExchangeRate, ExchangeRateError>;
 
 // user opens position
 //the mount_in
 //debt_value in collateral
 
-#[derive(CandidType, Deserialize, Clone, Copy)]
+#[derive(CandidType, Clone, Deserialize, Copy)]
 pub struct FundingRateTracker {
     pub net_volume_long: Amount,
     pub total_long_shares: Amount,
@@ -48,6 +163,18 @@ impl FundingRateTracker {
             return value;
         }
     }
+
+    pub fn settle_funding_rate(&mut self, funding_rate: u64, positive: bool) {
+        if positive {
+            let amount_to_settle = _percentage128(funding_rate, self.net_volume_long);
+            self.net_volume_short += amount_to_settle;
+            self.net_volume_long -= amount_to_settle;
+        } else {
+            let amount_to_settle = _percentage128(funding_rate, self.net_volume_short);
+            self.net_volume_long += amount_to_settle;
+            self.net_volume_short -= amount_to_settle
+        }
+    }
 }
 
 impl Storable for FundingRateTracker {
@@ -71,17 +198,15 @@ impl Default for FundingRateTracker {
     }
 }
 
-impl BoundedStorable for FundingRateTracker {
-    const IS_FIXED_SIZE: bool = true;
-
-    const MAX_SIZE: u32 = 64;
+#[derive(CandidType, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+pub struct ID {
+    pub principal_id: Principal,
 }
-
-#[derive(CandidType, Deserialize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
-pub struct ID(pub Principal);
 impl ID {
     pub fn from(principal: Principal) -> Self {
-        return ID(principal);
+        return ID {
+            principal_id: principal,
+        };
     }
 }
 
@@ -98,14 +223,7 @@ impl Storable for ID {
 impl BoundedStorable for ID {
     const IS_FIXED_SIZE: bool = true;
 
-    const MAX_SIZE: u32 = 30;
-}
-
-#[derive(CandidType, Deserialize, Clone, Copy)]
-/// Asset Class for querying the exchange rate canister
-enum AssetClass {
-    FiatCurrency,
-    Cryptocurrency,
+    const MAX_SIZE: u32 = 50;
 }
 
 impl Default for AssetClass {
@@ -114,29 +232,25 @@ impl Default for AssetClass {
     }
 }
 
-/// Asset type
-#[derive(CandidType, Default, Deserialize, Clone, Copy)]
-pub struct Asset {
-    /// symbol in utf-8 encoding arrays
-    symbol: [u8; 3],
-    /// asset class of particular asset
-    asset_class: AssetClass,
-}
-
 ///Market Details
-#[derive(CandidType, Deserialize, Clone, Copy)]
+#[derive(Clone, Deserialize, CandidType, Debug)]
 pub struct MarketDetails {
     /// The details of the  perpetual asset also seen as the base asset  
-    pub perp_asset_details: Asset,
+    pub base_asset: Asset,
 
     /// the details of the collateral token  in asset  all margin is paid
-    pub collateral_asset_details: Asset,
-    /// the principal  of collateral or margin token
-    pub collateral_asset: ID,
+    pub quote_asset: Asset,
+    /// Vault ID
+    ///
+    /// The canister ID of the vault canister
+    pub vault_id: Principal,
+    /// Watcher ID
+    ///
+    /// The cansiter ID of the watcher canister
+    pub watcher_id: Principal,
 
-    pub vault_id: ID,
+    pub xrc_id: Principal,
 
-    pub watcher_id: ID,
     /// token decimal of collateral token
     pub collateral_decimal: u8,
 }
@@ -144,20 +258,14 @@ pub struct MarketDetails {
 impl Default for MarketDetails {
     fn default() -> MarketDetails {
         return MarketDetails {
-            perp_asset_details: Asset::default(),
-            collateral_asset_details: Asset::default(),
-            collateral_asset: ID(Principal::anonymous()),
-            vault_id: ID(Principal::anonymous()),
-            watcher_id: ID(Principal::anonymous()),
+            base_asset: Asset::default(),
+            quote_asset: Asset::default(),
+            vault_id: Principal::anonymous(),
+            xrc_id: Principal::anonymous(),
+            watcher_id: Principal::anonymous(),
             collateral_decimal: 0,
         };
     }
-}
-
-impl BoundedStorable for MarketDetails {
-    const IS_FIXED_SIZE: bool = true;
-
-    const MAX_SIZE: u32 = 40;
 }
 
 impl Storable for MarketDetails {
@@ -173,9 +281,13 @@ impl Storable for MarketDetails {
 ///State Details comprises for useful parameters that change more frequently
 /// compared to market details  that is  set on initialization
 
-#[derive(CandidType, Default, Copy, Deserialize, Clone)]
+#[derive(CandidType, Default, Debug, PartialEq, Eq, Copy, Deserialize, Clone)]
 pub struct StateDetails {
+    /// Determine ifmarket is paused or not
+    pub not_paused: bool,
     /// Current Tick
+    ///
+    ///
     pub current_tick: Tick,
     /// Max Leverage
     ///
@@ -191,22 +303,11 @@ pub struct StateDetails {
     ///
     /// -this amount  is actuallly  reduced by the reduction i.e (10::pow(token_decimal - 6))
     pub min_collateral: Amount,
-    /// Interest Rate
-    ///
-    /// interest rate paid for holding an executed a position
-    ///
-    /// Note :
-    /// - order position type do not pay interest untile transaction is executed
-    pub interest_rate: u32,
+
     /// Base Token Multiplier
     ///
     /// base token multiple for cases of perp_assets with lower value than the underlying collateral asset
     pub base_token_multiple: u8,
-}
-
-impl BoundedStorable for StateDetails {
-    const IS_FIXED_SIZE: bool = true;
-    const MAX_SIZE: u32 = 41;
 }
 
 impl Storable for StateDetails {
@@ -221,54 +322,23 @@ impl Storable for StateDetails {
 
 #[derive(CandidType, Default, Deserialize, Clone, Copy)]
 pub struct TickDetails {
-    /// Liquidity Token0
-    ///
-    /// total amount of liquidity in token0 available at tick
-    pub liq_token0: Amount,
-    /// Liquidity Token1
-    ///
-    /// total amount of liquidity in token1 available at tick
-    pub liq_token1: Amount,
-    /// Total Shares
-    ///
-    /// total shares of al liqudiity providers with liquidity in this tick
-    pub total_shares: Amount,
-    /// Liquidity Boundary Token0
-    ///
-    /// liquidity bounds of token0 see (LiquidityBoundary)
     pub liq_bounds_token0: LiquidityBoundary,
     /// Liquidity Boundary Token1
     ///
     /// liquidity bounds of token1
     pub liq_bounds_token1: LiquidityBoundary,
-    /// Tick Cross Time
-    /// the last time crossed tracks the the last time static liquidity
-    /// was completely exhausted at tick
-    pub crossed_time: Time,
 }
 
 impl TickDetails {
     /// Add_liquidity function
     ///
     /// adds liquidity at current particular tick
-    pub fn _add_liquidity(
-        &mut self,
-        buy: bool,
-        amount_in: Amount,
-        delta_total_shares: Amount,
-        delta_liq_bound: Amount,
-    ) {
+    pub fn _add_liquidity(&mut self, buy: bool, amount_in: Amount) {
         if buy {
-            self.liq_bounds_token1._add_liquidity(delta_liq_bound);
-            // increases token1 for a buy order
-            self.liq_token1 += amount_in;
+            self.liq_bounds_token1._add_liquidity(amount_in);
         } else {
-            self.liq_bounds_token0._add_liquidity(delta_liq_bound);
-            // increases token1 for a buy order
-            self.liq_token0 += amount_in;
+            self.liq_bounds_token0._add_liquidity(amount_in);
         }
-        // increases shares in case order is a liquidity order
-        self.total_shares += delta_total_shares;
     }
 
     /// Reemove_liquidity function
@@ -280,10 +350,8 @@ impl TickDetails {
     pub fn _remove_liquidity(&mut self, buy: bool, amount_out: Amount) {
         if buy {
             self.liq_bounds_token1._remove_liquidity(amount_out);
-            self.liq_token1 -= amount_out;
         } else {
             self.liq_bounds_token0._remove_liquidity(amount_out);
-            self.liq_token0 -= amount_out;
         }
     }
 }
@@ -314,10 +382,10 @@ pub struct LiquidityBoundary {
     ///
     ///  - the amouunt  of dynamic liquidity at a current tick is the upper bound - lower bound
     pub lower_bound: Amount,
-    /// Removed Liquidity
+    /// Lifetime  Removed Liquidity
     ///
-    /// total removed static liquidity since last time crossed
-    pub removed_liquidity: Amount,
+    /// total amount of liquidity removed (by closing an order) at tick since initialisation
+    pub lifetime_removed_liquidity: Amount,
 }
 
 impl LiquidityBoundary {
@@ -327,18 +395,14 @@ impl LiquidityBoundary {
     ///
     /// setting the removed liquidity to zero
     pub fn _reduce_boundary(&mut self, amount: Amount) {
-        self.lower_bound += self.removed_liquidity + amount;
-        if self.lower_bound > self.upper_bound {
-            self.lower_bound = self.upper_bound
-        };
-        self.removed_liquidity = 0;
+        self.lower_bound += amount;
     }
 
     /// LLiquidity within
     ///
     /// calculates liquidity within a boundary
     pub fn _liquidity_within(&self) -> Amount {
-        return self.upper_bound - self.lower_bound - self.removed_liquidity;
+        return self.upper_bound - self.lower_bound;
     }
     /// Add Liqudity
     ///
@@ -351,6 +415,7 @@ impl LiquidityBoundary {
     ///
     /// removes liquidity from within a boundary be increasing removed liquidity
     pub fn _remove_liquidity(&mut self, delta: Amount) {
-        self.removed_liquidity += delta;
+        self.lower_bound += delta;
+        self.lifetime_removed_liquidity += delta
     }
 }

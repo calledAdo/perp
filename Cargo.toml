@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "src/perp",
-    "src/store"
+    "src/vault",
+    "src/xrc"
 ]
 resolver = "2"
+

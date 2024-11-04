@@ -1,6 +1,6 @@
-pub const _PRICE_DECIMAL: u64 = 1000_000_000;
+pub const _PRICE_DECIMAL: u128 = 1000_000_000;
 
-pub const _BASE_PRICE: u64 = 1000_000_000;
+pub const _BASE_PRICE: u128 = 1000_000_000;
 
 pub const _ONE_BASIS_POINT: u64 = 1000;
 

@@ -1,22 +1,36 @@
 use candid::{CandidType, Decode, Encode, Principal};
-use ic_cdk::export_candid;
+use ic_cdk::{export_candid, storage};
 
-use corelib::calc_lib::_calc_interest;
-use corelib::order_lib::{CloseOrderParams, OpenOrderParams, Order, TradeOrder};
+use sha2::{Digest, Sha256};
+
+use corelib::calc_lib::{_calc_interest, _percentage64};
+use corelib::constants::{_BASE_PRICE, _ONE_PERCENT};
+use corelib::order_lib::{CloseOrderParams, LimitOrder, OpenOrderParams};
 use corelib::price_lib::_equivalent;
 use corelib::swap_lib::SwapParams;
 use corelib::tick_lib::{_def_max_tick, _tick_to_price};
+use types::{
+    FundingRateTracker, GetExchangeRateRequest, GetExchangeRateResult, MarketDetails, StateDetails,
+    TickDetails, ID,
+};
 
-use types::{FundingRateTracker, MarketDetails, StateDetails, TickDetails, ID};
-
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::time::Duration;
 
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, Storable};
 use ic_stable_structures::{DefaultMemoryImpl, StableBTreeMap, StableCell};
+
+type Time = u64;
+type Amount = u128;
+type Tick = u64;
+type Subaccount = [u8; 32];
+
+type Memory = VirtualMemory<DefaultMemoryImpl>;
 
 const _MARKET_DETAILS_MEMORY: MemoryId = MemoryId::new(1);
 
@@ -26,14 +40,27 @@ const _USER_POSITION_MEMEORY: MemoryId = MemoryId::new(3);
 
 const _FUNDING_RATE_TRACKER_MEMORY: MemoryId = MemoryId::new(4);
 
-type Memory = VirtualMemory<DefaultMemoryImpl>;
+const _ADMIN_MEMORY: MemoryId = MemoryId::new(5);
+
+const _ACCOUNT_ERROR_LOGS_MEMORY: MemoryId = MemoryId::new(6);
+
+const ONE_HOUR: u64 = 3_600_000_000_000;
+
+const DEFAULT_SWAP_SLIPPAGE: u64 = 50_000; //0.5%
 
 thread_local! {
 
     static MEMORY_MANAGER:RefCell<MemoryManager<DefaultMemoryImpl>> = RefCell::new(MemoryManager::init(DefaultMemoryImpl::default())) ;
 
-    static MARKET_DETAILS:StableCell<MarketDetails,Memory> = StableCell::new(MEMORY_MANAGER.with(
-        |s|{s.borrow().get(_MARKET_DETAILS_MEMORY)}),MarketDetails::default()).unwrap();
+    static ADMIN:RefCell<StableCell<ID,Memory>> = RefCell::new(StableCell::new(MEMORY_MANAGER.with(|s|{
+        s.borrow().get(_ADMIN_MEMORY)
+    }),ID::from(Principal::anonymous())).unwrap());
+
+
+    static MARKET_DETAILS:RefCell<StableCell<MarketDetails,Memory>> = RefCell::new(StableCell::new(MEMORY_MANAGER.with(|s|{
+        s.borrow().get(_MARKET_DETAILS_MEMORY)
+    }),MarketDetails::default()).unwrap());
+
 
         /// State details
     static STATE_DETAILS:RefCell<StableCell<StateDetails,Memory>> = RefCell::new(StableCell::new(MEMORY_MANAGER.with(|s|{
@@ -44,17 +71,77 @@ thread_local! {
         s.borrow().get(_FUNDING_RATE_TRACKER_MEMORY)
     }),FundingRateTracker::default()).unwrap());
 
-    static USERS_POSITION:RefCell<StableBTreeMap<ID,PositionDetails,Memory>> = RefCell::new(
+    static ACCOUNTS_POSITION:RefCell<StableBTreeMap<Subaccount,PositionDetails,Memory>> = RefCell::new(
         StableBTreeMap::init(MEMORY_MANAGER.with(|s|{
         s.borrow().get(_USER_POSITION_MEMEORY)
     })));
 
-    static MULTIPLIERS_BITMAPS:RefCell<HashMap<u64,u128>> = RefCell::new(HashMap::new());
+
+    static ACCOUNTS_ERROR_LOGS:RefCell<StableBTreeMap<Subaccount,PositionUpdateErrorLog,Memory>> = RefCell::new(
+        StableBTreeMap::init(MEMORY_MANAGER.with(|s|{
+        s.borrow().get(_ACCOUNT_ERROR_LOGS_MEMORY)
+    })));
+
+    static INTEGRAL_BITMAPS:RefCell<HashMap<u64,u128>> = RefCell::new(HashMap::new());
 
     static TICKS_DETAILS :RefCell<HashMap<Tick,TickDetails>> = RefCell::new(HashMap::new());
 
+    static ERRORS:RefCell<Vec<ErrorType>> = RefCell::new(Vec::new());
 
+}
 
+#[ic_cdk::init]
+fn init(market_details: MarketDetails) {
+    let caller = ic_cdk::api::caller();
+
+    ADMIN.with(|ref_admin| ref_admin.borrow_mut().set(ID::from(caller)).unwrap());
+    MARKET_DETAILS.with(|ref_market_details| {
+        ref_market_details.borrow_mut().set(market_details).unwrap();
+    });
+}
+
+/// Get State Details
+///
+/// Returns the Current State Details
+
+#[ic_cdk::query(name = "getStateDetails")]
+fn get_state_details() -> StateDetails {
+    _get_state_details()
+}
+
+/// Get Market Details
+///
+///  Returns the Market Details
+
+#[ic_cdk::query(name = "getMarketDetails")]
+fn get_market_details() -> MarketDetails {
+    _get_market_details()
+}
+
+///  get Tick Details
+///
+/// Returns the tick details of a particular tick if it is intialised else returns false
+
+#[ic_cdk::query(name = "getTickDetails")]
+fn get_tick_details(tick: Tick) -> TickDetails {
+    TICKS_DETAILS.with(|ref_tick_details| ref_tick_details.borrow().get(&tick).unwrap().clone())
+}
+
+/// Try Close Function
+///
+/// Checks if a particular account's position of limit order type has been fully filled
+
+#[ic_cdk::query(name = "tryClose")]
+fn try_close(account: [u8; 32]) -> bool {
+    return convert_position(account);
+}
+
+/// Get Account Position
+///
+/// Gets an account position or panics if account has no position
+#[ic_cdk::query(name = "getAccountPosition")]
+fn get_account_position(account: [u8; 32]) -> PositionDetails {
+    return _get_account_position(&account);
 }
 
 /// Open PositionDetails function
@@ -66,98 +153,121 @@ thread_local! {
 /// - Max Tick :: max executing tick ,also seen as max price fro the _swap ,if set to none or set outside the required range ,default max tick is used
 /// - Leverage :: The leverage for the required position multiplies by 10 i.e a 1.5 levarage is 1.5 * 10 = 15
 /// - Long :: Indicating if its a long position or not ,true if long and false otherwise
-/// - Limit :: true if position type is a limit order
+/// - Order Type :: the type of order to create
+///  _
+///
+/// Returns
+///  - Position:the details of the position
 ///
 /// Note
-///  - If Order type is a limit order ,max tick coinsides with the reference tick for the tradeorder
+///  - If Order type is a limit order ,max tick coinsides with the reference tick for the limit order
+///  - ANON TICKS are for future purposes and have no effect for now
 
-#[ic_cdk::update]
+#[ic_cdk::update(name = "openPosition")]
 async fn open_position(
     collateral_value: Amount,
     max_tick: Option<Tick>,
     leveragex10: u8,
     long: bool,
-    limit: bool,
-) {
-    let user = ID(ic_cdk::caller());
+    order_type: OrderType,
+    _anon_tick1: Tick,
+    _anon_tick2: Tick,
+) -> Result<PositionDetails, String> {
+    let user = ic_cdk::caller();
+
+    let account = user._to_subaccount();
 
     //aseerts that user has no position already
-    USERS_POSITION.with(|ref_users_position| {
-        assert_eq!(ref_users_position.borrow().contains_key(&user), false);
-    });
+    let failed_initial_check = _has_position_or_pending_error_log(&account);
 
-    let market_details = MARKET_DETAILS.with(|ref_market_details| ref_market_details.get().clone());
+    if failed_initial_check {
+        return Err("Account has pending error or unclosed position ".to_string());
+    }
 
-    let mut state_details =
-        STATE_DETAILS.with(|ref_state_details| ref_state_details.borrow_mut().get().clone());
+    let mut state_details = _get_state_details();
+
+    assert!(state_details.not_paused);
 
     // if leverage is greater than max leverage or collateral value is less than min collateral
     //returns
     if leveragex10 >= state_details.max_leveragex10
         || collateral_value < state_details.min_collateral
     {
-        return;
+        return Err("Max leverage exceeded or collateral is too small".to_string());
     }
 
-    let vault = Vault::init(market_details.vault_id.0, market_details.collateral_asset.0);
+    let market_details = _get_market_details();
 
-    // if deposit fails exit function
-    if vault.send_asset_in(collateral_value).await == false {
-        return;
-    }
+    let vault = Vault::init(market_details.vault_id);
 
-    // levarage is asways given as a multiple of ten
+    // levarage is always given as a multiple of ten
     let debt_value = (u128::from(leveragex10 - 10) * collateral_value) / 10;
 
-    // if not enough liquidity to give out debt ,refund user and exit
-    if vault.borrow_liquidty(debt_value).await == false {
-        vault.send_asset_out(collateral_value);
-        return;
+    // Checks if user has sufficient balance and vault contains free liquidity greater or equal to debt_value and then calculate interest rate
+
+    let (valid, interest_rate) = vault
+        .create_position_validity_check(user, collateral_value, debt_value)
+        .await;
+
+    if valid == false {
+        return Err("Not enough liquidity for debt".to_string());
     };
 
     let stopping_tick = max_or_default_max(max_tick, state_details.current_tick, long);
 
     match _open_position(
+        account,
         long,
-        limit,
+        order_type,
         collateral_value,
         debt_value,
-        state_details.interest_rate,
+        interest_rate,
         state_details.current_tick,
         stopping_tick,
     ) {
-        Some((unutilised_debt, resulting_tick, _crossed_ticks)) => {
+        Some((position, resulting_tick, crossed_ticks)) => {
             // update current tick
             state_details.current_tick = resulting_tick;
 
-            STATE_DETAILS.with(|ref_state_details| {
-                ref_state_details.borrow_mut().set(state_details).unwrap()
-            });
+            _update_state_details(state_details);
 
-            vault.update_asset_details(None, unutilised_debt, 0);
+            let watcher = Watcher::init(market_details.watcher_id);
 
-            if limit {
-                let watcher = Watcher::init(market_details.watcher_id.0);
+            if let OrderType::Limit = order_type {
+                watcher.store_tick_order(stopping_tick, account);
+            } else {
+                watcher.execute_ticks_orders(crossed_ticks);
 
-                watcher.store_tick_order(stopping_tick, user);
+                if position.debt_value != debt_value
+                    || collateral_value != position.collateral_value
+                {
+                    let un_used_collateral = collateral_value - position.collateral_value;
+                    vault.manage_position_update(
+                        user,
+                        collateral_value - position.collateral_value,
+                        ManageDebtParams::init(position.debt_value, debt_value, un_used_collateral),
+                    );
+                }
             }
+
+            return Ok(position);
         }
         None => {
-            // if debt was not utilised ,refund user and send back debt
-            vault.send_asset_out(collateral_value);
-
             // send back
-            vault.update_asset_details(None, debt_value, 0);
+            vault.manage_position_update(
+                user,
+                collateral_value,
+                ManageDebtParams::init(0, debt_value, 0),
+            );
 
-            // panic to revert swap
-            assert_eq!(true, false)
+            return Err("Failed to open position".to_string());
         }
     }
 }
 
 ///Close PositionDetails Function
 ///
-/// closes user position and sends back collateral
+/// Closes user position and sends back collateral
 ///
 /// Returns
 ///  - Profit :The amount to send to position owner
@@ -165,69 +275,65 @@ async fn open_position(
 /// Note
 ///  - if position_type is order ,the collateral is sent back and debt is sent back without interest
 ///
-#[ic_cdk::update]
-async fn close_position() -> Amount {
-    let user = ID(ic_cdk::caller());
+#[ic_cdk::update(name = "closePosition")]
+async fn close_position(max_tick: Option<Tick>) -> Amount {
+    let user = ic_cdk::caller();
 
-    let mut state_details =
-        STATE_DETAILS.with(|ref_state_details| ref_state_details.borrow_mut().get().clone());
+    let account = user._to_subaccount();
 
-    let market_details = MARKET_DETAILS.with(|ref_market_details| ref_market_details.get().clone());
+    let mut position = _get_account_position(&account);
+
+    let mut state_details = _get_state_details();
+
+    assert!(state_details.not_paused);
+    //
+    let market_details = _get_market_details();
 
     // vault canister
-    let vault = Vault::init(market_details.vault_id.0, market_details.collateral_asset.0);
+    let vault = Vault::init(market_details.vault_id);
 
-    let current_tick = state_details.current_tick;
+    let watcher = Watcher::init(market_details.watcher_id);
 
-    let position =
-        USERS_POSITION.with(|ref_user_position| ref_user_position.borrow().get(&user).unwrap());
+    match position.order_type {
+        PositionOrderType::Market => {
+            let current_tick = state_details.current_tick;
 
-    match position.position_type {
-        PositionType::Market => {
+            let stopping_tick = max_or_default_max(max_tick, current_tick, !position.long);
             // if position type is market ,means the position is already active
-
-            let (profit, resulting_tick, crossed_ticks) = if position.long {
-                _close_long_position(user, position, current_tick, 10000, vault)
+            let (collateral_value, resulting_tick, crossed_ticks, manage_debt_params) = if position
+                .long
+            {
+                _close_market_long_position(account, &mut position, current_tick, stopping_tick)
             } else {
-                _close_short_position(user, position, current_tick, 100000, vault)
+                _close_market_short_position(account, &mut position, current_tick, stopping_tick)
             };
             // update current_tick
             state_details.current_tick = resulting_tick;
 
-            STATE_DETAILS.with(|ref_state_details| {
-                ref_state_details.borrow_mut().set(state_details).unwrap()
-            });
-
-            vault.send_asset_out(profit);
-
-            let watcher = Watcher::init(market_details.watcher_id.0);
+            _update_state_details(state_details);
 
             // send out ticks
             watcher.execute_ticks_orders(crossed_ticks);
 
-            // return profits
-            return profit;
-        }
-        PositionType::Order(order) => {
-            // close trade _order
-            _close_order(&order, order.order_size, order.buy, order.ref_tick);
+            vault.manage_position_update(user, collateral_value, manage_debt_params);
 
-            let debt = if position.long {
-                position.debt
+            // return profits
+            return collateral_value;
+        }
+        PositionOrderType::Limit(_) => {
+            let (removed_collateral, manage_debt_params) = if position.long {
+                _close_limit_long_position(account, &mut position)
             } else {
-                let tick_price = _tick_to_price(order.ref_tick);
-                _equivalent(position.debt, tick_price, false)
+                _close_limit_short_position(account, &mut position)
             };
 
-            // delete user position
-            USERS_POSITION.with(|ref_user_position| ref_user_position.borrow_mut().remove(&user));
+            if manage_debt_params.new_debt == 0 {
+                watcher.remove_tick_order(position.entry_tick, account)
+            }
 
-            // send asset out
-            vault.send_asset_out(position.collateral_value);
-            // uodate position
-            vault.update_asset_details(None, debt, 0);
+            vault.manage_position_update(user, removed_collateral, manage_debt_params);
 
-            return position.collateral_value;
+            return removed_collateral;
         }
     };
 }
@@ -241,54 +347,37 @@ async fn close_position() -> Amount {
 ///
 /// Note:
 ///  - This function can only be called by watcher
+///  - This function does not check if canister is paused or not,to prevent watcher from encountering an error
 
-#[ic_cdk::update]
-async fn convert_position(user_id: Principal) {
-    let user = ID(user_id);
-    let mut position =
-        USERS_POSITION.with(|ref_user_position| ref_user_position.borrow().get(&user).unwrap());
+#[ic_cdk::update(name = "convertPosition")]
+fn convert_position(account: Subaccount) -> bool {
+    // assert that only watcher can call this function
 
-    let equivalent = |amount: Amount, buy: bool| -> Amount {
-        let current_price = _tick_to_price(position.entry_tick);
-        _equivalent(amount, current_price, buy)
-    };
+    let mut position = _get_account_position(&account);
 
-    if let PositionType::Order(_) = position.position_type {
-        let volume_share = FUNDING_RATE_TRACKER.with(|tr| {
-            let mut funding_rate_tracker = { tr.borrow().get().clone() };
+    if let PositionOrderType::Limit(order) = position.order_type {
+        //since tivk is deleted ,order has been confirmed closed
+        let (_, amount_remaining) = _close_order(&order);
 
-            let debt_value = if position.long {
-                position.debt
-            } else {
-                equivalent(position.debt, false)
-            };
+        let valid_close = amount_remaining == 0;
+        _convert_limit_position(&mut position, 0);
+        _insert_account_position(account, position);
 
-            let share = funding_rate_tracker
-                .add_volume(position.collateral_value + debt_value, position.long);
-            //
-            //
-            tr.borrow_mut().set(funding_rate_tracker).unwrap();
-            share
-        });
-
-        position.timestamp = 0; // now
-        position.volume_share = volume_share;
-        position.position_type = PositionType::Market;
-
-        USERS_POSITION.with(|ref_users_position| {
-            ref_users_position
-                .borrow_mut()
-                .insert(ID(ic_cdk::caller()), position)
-        });
+        return valid_close;
     }
+
+    return false;
 }
+
 ///
 ///
 /// Open PositionDetails (Private)
 ///
 /// opens a position for user if possible
 /// Params
+///  - User :The owner of the position
 ///  - Long : Position direction ,true if long or false otherwise
+///  - Limit : true for opening a limit order and false for a market order
 ///  - Collateral Value : amount of collateral asset being put in as collateral
 ///  - Debt Value : The amount of collateral_asset used as debt for opening position
 ///  - Interest Rate : The current interest rate for opening a position
@@ -297,112 +386,131 @@ async fn convert_position(user_id: Principal) {
 ///
 /// Returns
 ///  - Option containing
-///  - - Amount Remaining Value :The value of  amount remaining or amount of unutilised debt
+///  - - Position Details :The details of the position created
 ///  - - Resulting Tick :The resuting tick from swapping
 ///  - - Crossed Ticks :A vector of all crossed ticks during swap
 /// Note
 ///  - If position can not be opened it returns none and both collateral and debt gets refunded back and swap is reverted afterwards
 ///
 fn _open_position(
+    account: Subaccount,
     long: bool,
-    limit: bool,
+    order_type: OrderType,
     collateral_value: Amount,
     debt_value: Amount,
     interest_rate: u32,
-    entry_tick: Tick,
+    current_tick: Tick,
     max_tick: Tick,
-) -> Option<(Amount, Tick, Vec<Tick>)> {
-    let current_price = _tick_to_price(entry_tick);
-
+) -> Option<(PositionDetails, Tick, Vec<Tick>)> {
     //
-    let equivalent =
-        |amount: Amount, buy: bool| -> Amount { _equivalent(amount, current_price, buy) };
-
-    let (collateral, debt) = if long {
-        (collateral_value, debt_value)
-    } else {
-        (
-            equivalent(collateral_value, true),
-            equivalent(debt_value, true),
-        )
+    let equivalent = |amount: Amount, tick: Tick, buy: bool| -> Amount {
+        let tick_price = _tick_to_price(tick);
+        _equivalent(amount, tick_price, buy)
     };
     let position: PositionDetails;
 
-    let result; //(unutilised_debt,resulting_tick,crossed_ticks);
+    let open_position_result; //(actual debt,resulting_tick,crossed_ticks);
 
-    match limit {
-        true => {
+    match order_type {
+        OrderType::Limit => {
             let entry_tick = max_tick;
-            //
-            let mut order = TradeOrder::new(collateral + debt, entry_tick, long);
+            // limit order's can't be placed at current tick
+            if long && entry_tick >= current_tick {
+                return None;
+            } else if !long && entry_tick <= current_tick {
+                return None;
+            } else {
+            };
 
-            _open_order(&mut order, entry_tick);
+            let (collateral, debt) = if long {
+                (collateral_value, debt_value)
+            } else {
+                (
+                    equivalent(collateral_value, entry_tick, true),
+                    equivalent(debt_value, entry_tick, true),
+                )
+            };
+            //
+            let mut order = LimitOrder::new(collateral + debt, entry_tick, long);
+
+            _open_order(&mut order);
 
             position = PositionDetails {
                 long,
                 entry_tick,
                 collateral_value,
-                debt,
+                debt_value,
                 interest_rate,
                 volume_share: 0, // not initialised yet
-                position_type: PositionType::Order(order),
+                order_type: PositionOrderType::Limit(order),
                 timestamp: 0, //not initialised
             };
 
-            result = (0, entry_tick, Vec::new());
+            open_position_result = (position, current_tick, Vec::new());
         }
 
         //
-        false => {
+        OrderType::Market => {
+            let (collateral, debt) = if long {
+                (collateral_value, debt_value)
+            } else {
+                (
+                    equivalent(collateral_value, current_tick, true),
+                    equivalent(debt_value, current_tick, true),
+                )
+            };
+
             // swap is executed
 
-            let (_, amount_remaining, resulting_tick, crossed_ticks) =
-                _swap(collateral + debt, long, entry_tick, max_tick);
+            let (amount_out, amount_remaining, resulting_tick, crossed_ticks) =
+                _swap(collateral + debt, long, current_tick, max_tick);
 
-            if amount_remaining >= debt {
+            if amount_out == 0 {
                 return None;
             }
+
+            let (unused_collateral_value, unused_debt_value);
 
             // the amount remaining value to be refunded to
             let amount_remaining_value = if long {
                 amount_remaining
             } else {
-                equivalent(amount_remaining, false)
+                equivalent(amount_remaining, current_tick, false)
             };
 
-            let volume_share = FUNDING_RATE_TRACKER.with(|tr| {
-                let mut funding_rate_tracker = { tr.borrow().get().clone() };
+            if amount_remaining_value >= debt_value {
+                unused_debt_value = debt_value;
+                unused_collateral_value = amount_remaining - debt_value
+            } else {
+                unused_debt_value = amount_remaining_value;
+                unused_collateral_value = 0
+            }
 
-                let share = funding_rate_tracker
-                    .add_volume(collateral_value + debt_value - amount_remaining_value, long);
-                //
-                //
-                tr.borrow_mut().set(funding_rate_tracker).unwrap();
-                share
-            });
+            let resulting_debt_value = debt_value - unused_debt_value;
+            let resulting_collateral_value = collateral_value - unused_collateral_value;
+
+            let volume_share = _calc_position_volume_share(
+                collateral_value + debt_value - amount_remaining_value,
+                long,
+            );
 
             position = PositionDetails {
                 long,
                 entry_tick: resulting_tick,
-                collateral_value,
-                debt: debt - amount_remaining, //actual debt
+                collateral_value: resulting_collateral_value,
+                debt_value: resulting_debt_value, //actual debt
                 interest_rate,
-
                 volume_share,
-                position_type: PositionType::Market,
-                timestamp: 1000, //change to time()
+                order_type: PositionOrderType::Market,
+                timestamp: ic_cdk::api::time(), //change to time()
             };
-            result = (amount_remaining_value, resulting_tick, crossed_ticks);
+            open_position_result = (position, resulting_tick, crossed_ticks);
         }
     }
 
-    USERS_POSITION.with(|ref_users_position| {
-        ref_users_position
-            .borrow_mut()
-            .insert(ID(ic_cdk::caller()), position)
-    });
+    _insert_account_position(account, position);
 
-    return Some(result);
+    return Some(open_position_result);
 }
 
 /// Close Long PositionDetails
@@ -410,220 +518,319 @@ fn _open_position(
 ///closes a user's  long position if position can be fully closed and  repays debt
 ///
 /// Params
-/// - User :The user
+/// - User :The user (position owner)
 /// - PositionDetails :The PositionDetails
 /// - Current Tick :The current tick of market's state
 /// - Stopping Tick : The max tick,corresponds to max price
 /// - Vault : Vault canister
 ///
 /// Returns
-///  - Profit :The amount to send to position owner after paying debt ,this amount is zero if debt is not fully paid
+///  - Current Collateral :The amount to send to position owner after paying debt ,this amount is zero if debt is not fully paid
 ///  - Resulting Tick :The resulting tick from swapping
 ///  - Crosssed Ticks :An array of ticks that have been crossed during swapping
 ///   
 /// Note
 ///  - If position can not be closed fully ,the position is partially closed (updated) and debt is paid back either fully or partially
-fn _close_long_position(
-    user: ID,
-    position: PositionDetails,
+fn _close_market_long_position(
+    account: Subaccount,
+    position: &mut PositionDetails,
     current_tick: Tick,
     stopping_tick: Tick,
-    vault: Vault,
-) -> (Amount, Tick, Vec<Tick>) {
+) -> (Amount, Tick, Vec<Tick>, ManageDebtParams) {
     //
+    let entry_price = _tick_to_price(position.entry_tick);
+    let equivalent_at_entry_price =
+        |amount: Amount, buy: bool| -> Amount { _equivalent(amount, entry_price, buy) };
     //
-    let equivalent = |amount: Amount, tick: Tick, buy: bool| -> Amount {
-        let current_price = _tick_to_price(tick);
-        _equivalent(amount, current_price, buy)
-    };
-    //
-    let position_realised_value = FUNDING_RATE_TRACKER.with(|tr| {
-        let mut funding_rate_tracker = { tr.borrow().get().clone() };
-        let value = funding_rate_tracker.remove_volume(position.volume_share, true);
-        tr.borrow_mut().set(funding_rate_tracker).unwrap();
-        value
-    });
+    let position_realised_value = _calc_position_realised_val(position.volume_share, true);
+    // amount to swap
 
-    // perp  asset
+    let realised_position_size = equivalent_at_entry_price(position_realised_value, true);
 
-    let realised_position_size = equivalent(position_realised_value, position.entry_tick, true);
-
-    //sell
-
-    let (amount_out, amount_remaining, resulting_tick, crossed_ticks) =
+    let (amount_out_value, amount_remaining, resulting_tick, crossed_ticks) =
         _swap(realised_position_size, false, current_tick, stopping_tick);
 
-    let interest_fee = _calc_interest(position.debt, position.interest_rate, position.timestamp);
-
-    let total_fee = position.debt + interest_fee;
+    let interest_value = _calc_interest(
+        position.debt_value,
+        position.interest_rate,
+        position.timestamp,
+    );
 
     let profit;
 
+    let manage_debt_params;
+
     if amount_remaining > 0 {
-        // update position ,paying debt either partially or fully
-        let new_volume_share = FUNDING_RATE_TRACKER.with(|tr| {
-            let mut funding_rate_tracker = { tr.borrow().get().clone() };
-
-            let share = funding_rate_tracker
-                .add_volume(equivalent(amount_remaining, resulting_tick, false), true);
-
-            tr.borrow_mut().set(funding_rate_tracker).unwrap();
-            share
-        });
-
-        let mut new_position = PositionDetails {
-            entry_tick: resulting_tick,
-            collateral_value: position.collateral_value,
-            long: position.long,
-            debt: 0, // initialise debt as 0
-            volume_share: new_volume_share,
-
-            interest_rate: position.interest_rate,
-            position_type: PositionType::Market,
-            timestamp: position.timestamp,
-        };
-
+        let amount_remaining_value = equivalent_at_entry_price(amount_remaining, false);
         //
-        if amount_out < total_fee {
-            //update new position details
-            new_position.debt = total_fee - amount_out;
-            new_position.timestamp = 1000; //change
+        (profit, manage_debt_params) = _update_market_position_after_swap(
+            position,
+            resulting_tick,
+            amount_out_value,
+            amount_remaining_value,
+            interest_value,
+        );
 
-            // if any debt can be given at all
-            let interest_received = if amount_out > position.debt {
-                amount_out - position.debt
-            } else {
-                0
-            };
-
-            vault.update_asset_details(Some(new_position.debt), amount_out, interest_received);
-
-            // profit is zero
-            profit = 0;
-        } else {
-            // debt is zero
-            new_position.collateral_value = new_volume_share;
-
-            vault.update_asset_details(None, position.debt, interest_fee);
-
-            profit = amount_out - total_fee;
-        }
-
-        //
-        USERS_POSITION
-            .with(|ref_user_position| ref_user_position.borrow_mut().insert(user, new_position));
-        //()
+        _insert_account_position(account, position.clone());
     } else {
-        profit = amount_out - total_fee;
-
-        USERS_POSITION.with(|ref_user_position| ref_user_position.borrow_mut().remove(&user));
+        (profit, manage_debt_params) = (
+            amount_out_value - (position.debt_value + interest_value),
+            ManageDebtParams::init(0, position.debt_value, interest_value),
+        );
+        _remove_account_position(&account);
     }
 
-    return (profit, resulting_tick, crossed_ticks);
+    return (profit, resulting_tick, crossed_ticks, manage_debt_params);
 }
 
 ///
 /// Close Short Position
 ///
 /// similar to Close Long Function,but for short positions
-
-fn _close_short_position(
-    user: ID,
-    position: PositionDetails,
+///
+fn _close_market_short_position(
+    account: Subaccount,
+    position: &mut PositionDetails,
     current_tick: Tick,
     stopping_tick: Tick,
-    vault: Vault,
-) -> (Amount, Tick, Vec<Tick>) {
-    //
-    //
-    let equivalent = |amount: Amount, tick: Tick, buy: bool| -> Amount {
-        let current_price = _tick_to_price(tick);
-        _equivalent(amount, current_price, buy)
-    };
-
-    let position_realised_value = FUNDING_RATE_TRACKER.with(|tr| {
-        let mut funding_rate_tracker = tr.borrow().get().clone();
-        //
-        let value = funding_rate_tracker.remove_volume(position.volume_share, false);
-        //
-        tr.borrow_mut().set(funding_rate_tracker).unwrap();
-        value
-    });
+) -> (Amount, Tick, Vec<Tick>, ManageDebtParams) {
+    let position_realised_value = _calc_position_realised_val(position.volume_share, false);
 
     let realised_position_size = position_realised_value;
 
-    let (amount_out, amount_remaining, resulting_tick, crossed_ticks) =
+    let (amount_out, amount_remaining_value, resulting_tick, crossed_ticks) =
         _swap(realised_position_size, true, current_tick, stopping_tick);
 
-    let interest_fee = _calc_interest(position.debt, position.interest_rate, position.timestamp);
+    let init_price = _tick_to_price(current_tick);
 
-    let total_fee = position.debt + interest_fee;
+    // amount out value is calculated as the amount of collateral token used up in the swap
+    let amount_out_value = _equivalent(amount_out, init_price, false); // position_realised_value - amount_remaining_value;
+
+    let interest_value = _calc_interest(
+        position.debt_value,
+        position.interest_rate,
+        position.timestamp,
+    );
 
     let profit;
+    let manage_debt_params: ManageDebtParams;
 
-    if amount_remaining != 0 {
-        let new_volume_share = FUNDING_RATE_TRACKER.with(|tr| {
-            let mut funding_rate_tracker = { tr.borrow().get().clone() };
+    if amount_remaining_value > 0 {
+        (profit, manage_debt_params) = _update_market_position_after_swap(
+            position,
+            resulting_tick,
+            amount_out_value,
+            amount_remaining_value,
+            interest_value,
+        );
 
-            let share = funding_rate_tracker.add_volume(amount_remaining, position.long);
-
-            tr.borrow_mut().set(funding_rate_tracker).unwrap();
-            share
-        });
-
-        //
-        let mut new_position = PositionDetails {
-            entry_tick: resulting_tick,
-            collateral_value: position.collateral_value,
-            long: position.long,
-            debt: 0,
-            volume_share: new_volume_share,
-            interest_rate: position.interest_rate,
-            position_type: PositionType::Market,
-            timestamp: 1000,
-        };
-
-        if amount_out < total_fee {
-            new_position.debt = total_fee - amount_out;
-
-            let interest_received = if amount_out > position.debt {
-                amount_out - position.debt
-            } else {
-                0
-            };
-            //
-            vault.update_asset_details(
-                Some(equivalent(new_position.debt, resulting_tick, false)),
-                equivalent(amount_out, resulting_tick, false),
-                equivalent(interest_received, resulting_tick, false),
-            );
-
-            profit = 0;
-        } else {
-            new_position.collateral_value = new_volume_share;
-            vault.update_asset_details(
-                None,
-                equivalent(position.debt, resulting_tick, false),
-                equivalent(interest_fee, resulting_tick, false),
-            );
-
-            profit = equivalent(amount_out - total_fee, resulting_tick, false);
-        }
-
-        USERS_POSITION
-            .with(|ref_user_position| ref_user_position.borrow_mut().insert(user, new_position));
+        _insert_account_position(account, position.clone());
     } else {
-        profit = equivalent(amount_out - total_fee, resulting_tick, false);
-
+        (profit, manage_debt_params) = (
+            amount_out_value - (position.debt_value + interest_value),
+            ManageDebtParams::init(0, position.debt_value, interest_value),
+        );
         // deletes user position
-        USERS_POSITION.with(|ref_user_position| ref_user_position.borrow_mut().remove(&user));
+        _remove_account_position(&account);
     }
 
-    return (profit, resulting_tick, crossed_ticks);
+    return (profit, resulting_tick, crossed_ticks, manage_debt_params);
+}
+
+/// Close Limit Position
+///
+///
+/// Closes a limit position at a particular tick by closing removing the limit order if the order is not filled
+///
+/// Params
+///  - User : The owner of the position
+///  - Position : The particular position to close
+///  - Vault :The vault type representing the vault canister  
+
+fn _close_limit_long_position(
+    account: Subaccount,
+    position: &mut PositionDetails,
+) -> (Amount, ManageDebtParams) {
+    match position.order_type {
+        //
+        PositionOrderType::Limit(order) => {
+            let (amount_received, amount_remaining_value) = _close_order(&order);
+
+            let (removed_collateral, manage_debt_params);
+
+            if amount_received == 0 {
+                (removed_collateral, manage_debt_params) = (
+                    position.collateral_value,
+                    ManageDebtParams::init(0, position.debt_value, 0),
+                );
+
+                _remove_account_position(&account);
+            } else {
+                (removed_collateral, manage_debt_params) =
+                    _convert_limit_position(position, amount_remaining_value);
+                //
+                _insert_account_position(account, position.clone());
+            };
+
+            return (removed_collateral, manage_debt_params);
+        }
+        PositionOrderType::Market => (0, ManageDebtParams::default()),
+    }
 }
 
 ///
+/// Close Limit Short Function
 ///
+/// similar to close limit long position function but for long position
+///
+///
+///
+
+fn _close_limit_short_position(
+    account: Subaccount,
+    position: &mut PositionDetails,
+) -> (Amount, ManageDebtParams) {
+    match position.order_type {
+        PositionOrderType::Limit(order) => {
+            let (amount_received, amount_remaining) = _close_order(&order);
+
+            let (removed_collateral, manage_debt_params);
+
+            if amount_received == 0 {
+                (removed_collateral, manage_debt_params) = (
+                    position.collateral_value,
+                    ManageDebtParams::init(0, position.debt_value, 0),
+                );
+                _remove_account_position(&account);
+                //
+            } else {
+                let entry_price = _tick_to_price(position.entry_tick);
+
+                let amount_remaining_value = _equivalent(amount_remaining, entry_price, false);
+                (removed_collateral, manage_debt_params) =
+                    _convert_limit_position(position, amount_remaining_value);
+                // updates users positiion
+                _insert_account_position(account, position.clone());
+            };
+
+            return (removed_collateral, manage_debt_params);
+        }
+        PositionOrderType::Market => return (0, ManageDebtParams::default()),
+    }
+}
+
+/// Update Market Position After Swap Function
+///
+/// This function updates a  market position if it can not be closed i.e amount remaining after swapping to close position is greater than 0
+///
+/// It
+///   - Updates the position debt ,the position collateral value , the position volume share
+///   - Derives the update asset params that pays the debt either fully or partially
+///
+/// Params
+///  - Position :A mutable reference to the particular position
+///  - Resulting Tick : The resulting tick after swapping to closing the position
+///  - Amount Out Value :The value of the amount gotten from swapping
+///  - Amount Remaining Value :The value of the amount remaining after swapping
+///  - Interest Value : The value of the interest accrued on current position debt
+///
+/// Returns
+///  - Profit : The amount of profit for position owner or the amount of removable collateral from position
+///  - Manage Debt Params : for repaying debt ,specifying the current debt and the previous debt and interest paid
+///
+
+fn _update_market_position_after_swap(
+    position: &mut PositionDetails,
+    resulting_tick: Tick,
+    amount_out_value: Amount,
+    amount_remaining_value: Amount,
+    interest_value: Amount,
+) -> (Amount, ManageDebtParams) {
+    let initial_debt = position.debt_value;
+
+    let total_fee_value = initial_debt + interest_value;
+
+    let profit;
+    let manage_debt_params;
+    //
+    if amount_out_value < total_fee_value {
+        // if any interest can be given at all
+        let interest_received_value = if amount_out_value > position.debt_value {
+            amount_out_value - position.debt_value
+        } else {
+            0
+        };
+        //update new position details
+        position.debt_value = total_fee_value - amount_out_value;
+
+        manage_debt_params =
+            ManageDebtParams::init(position.debt_value, initial_debt, interest_received_value);
+        profit = 0;
+    } else {
+        position.debt_value = 0;
+        position.collateral_value = amount_remaining_value;
+
+        manage_debt_params = ManageDebtParams::init(0, position.debt_value, interest_value);
+        profit = amount_out_value - total_fee_value;
+    }
+
+    let new_volume_share = _calc_position_volume_share(amount_remaining_value, position.long);
+    //
+    position.volume_share = new_volume_share;
+    position.entry_tick = resulting_tick;
+
+    // if position last time updated is greater than one hour ago ,position time is updated to current timestamp
+    if position.timestamp + ONE_HOUR > ic_cdk::api::time() {
+        position.timestamp = ic_cdk::api::time()
+    }
+
+    return (profit, manage_debt_params);
+}
+
+///
+/// Convert Limit Position function
+///
+/// Converts a limit position into a market position after the reference limit order of that position has been filled fully or partially
+/// any unfilled amount is refunded first as debt and if still remaining it is refunded back to the position owner and the position is updated to a market position
+///
+/// Params
+///  - Position : A mutable reference to the cuurent position
+///  - Amount Remaining Value : The value of the amount of  unfilled liquidity of the particular order
+///
+/// Returns
+///  - Removed Collateral : The amount of collateral removed from that position
+///  - Update Asset Details Params :The update asset details params for updating asset detailsin params   
+///
+fn _convert_limit_position(
+    position: &mut PositionDetails,
+    amount_remaining_value: Amount,
+) -> (Amount, ManageDebtParams) {
+    let remaining_order_value =
+        position.collateral_value + position.debt_value - amount_remaining_value; // value of amount out
+    let initial_debt = position.debt_value;
+    //
+    let removed_collateral;
+    if amount_remaining_value > position.debt_value {
+        removed_collateral = amount_remaining_value - position.debt_value;
+
+        position.debt_value = 0;
+        position.collateral_value -= removed_collateral;
+    } else {
+        removed_collateral = 0;
+
+        position.debt_value -= amount_remaining_value;
+    }
+    let volume_share = _calc_position_volume_share(remaining_order_value, position.long);
+
+    position.volume_share = volume_share;
+    position.order_type = PositionOrderType::Market;
+    position.timestamp = ic_cdk::api::time();
+
+    let manage_debt_params = ManageDebtParams::init(position.debt_value, initial_debt, 0);
+
+    return (removed_collateral, manage_debt_params);
+}
+
 ///
 /// Opens Order Functions
 ///
@@ -633,19 +840,14 @@ fn _close_short_position(
 /// - Order :: a generic type that implements the trait Order for the type of order to close
 /// - Reference Tick :: The  tick to place order
 
-fn _open_order<V: Order>(order: &mut V, reference_tick: Tick) {
-    TICKS_DETAILS.with(|ref_ticks_details| {
-        let ticks_details = &mut *ref_ticks_details.borrow_mut();
-        MULTIPLIERS_BITMAPS.with(|ref_multiplier_bitmaps| {
-            let multipliers_bitmaps = &mut *ref_multiplier_bitmaps.borrow_mut();
-
+fn _open_order(order: &mut LimitOrder) {
+    TICKS_DETAILS.with_borrow_mut(|ticks_details| {
+        INTEGRAL_BITMAPS.with_borrow_mut(|integrals_bitmaps| {
             let mut open_order_params = OpenOrderParams {
                 order,
-                reference_tick,
-                multipliers_bitmaps,
+                integrals_bitmaps,
                 ticks_details,
             };
-
             open_order_params.open_order();
         })
     });
@@ -666,26 +868,11 @@ fn _open_order<V: Order>(order: &mut V, reference_tick: Tick) {
 ///  - Amont Out :: This corresponds to the asset to be bought i.e perp(base) asset for a buy order or quote asset for a sell order
 ///  - Amount Remaining :: This amount remaining corrseponds to the amount of asset at that tick that is still unfilled
 ///
-/// Note
-///  - When closing Liqudiity order ,amount out  and amount remaining corresponds to amount of perp asset and collateral asset respectively
-///
-
-fn _close_order<V: Order>(
-    order: &V,
-    order_size: Amount,
-    order_direction: bool,
-    order_reference_tick: Tick,
-) -> (Amount, Amount) {
-    TICKS_DETAILS.with(|ref_ticks_details| {
-        let ticks_details = &mut *ref_ticks_details.borrow_mut();
-        MULTIPLIERS_BITMAPS.with(|ref_multiplier_bitmaps| {
-            let multipliers_bitmaps = &mut *ref_multiplier_bitmaps.borrow_mut();
-
+fn _close_order(order: &LimitOrder) -> (Amount, Amount) {
+    TICKS_DETAILS.with_borrow_mut(|ticks_details| {
+        INTEGRAL_BITMAPS.with_borrow_mut(|multipliers_bitmaps| {
             let mut close_order_params = CloseOrderParams {
                 order,
-                order_size,
-                order_direction,
-                order_reference_tick,
                 multipliers_bitmaps,
                 ticks_details,
             };
@@ -705,25 +892,22 @@ fn _close_order<V: Order>(
 /// Returns
 ///  - Amount Out :: The amount out froom swapping
 ///  - Amount Remaining :: The amount remaining from swapping
+///  - resulting Tick :The last tick at which swap occured
 ///  - Crossed Ticks :: An vector of all ticks crossed during swap
-
 fn _swap(
     order_size: Amount,
     buy: bool,
     init_tick: Tick,
     stopping_tick: Tick,
 ) -> (Amount, Amount, Tick, Vec<Tick>) {
-    TICKS_DETAILS.with(|ref_ticks_details| {
-        let ticks_details = &mut ref_ticks_details.borrow_mut();
-        MULTIPLIERS_BITMAPS.with(|ref_multiplier_bitmaps| {
-            let multipliers_bitmaps = &mut ref_multiplier_bitmaps.borrow_mut();
-
+    TICKS_DETAILS.with_borrow_mut(|ticks_details| {
+        INTEGRAL_BITMAPS.with_borrow_mut(|integrals_bitmaps| {
             let mut swap_params = SwapParams {
                 buy,
                 init_tick,
                 stopping_tick,
                 order_size,
-                multipliers_bitmaps,
+                integrals_bitmaps,
                 ticks_details,
             };
             swap_params._swap()
@@ -745,116 +929,331 @@ fn max_or_default_max(max_tick: Option<Tick>, current_tick: Tick, buy: bool) -> 
                 return tick;
             }
         }
-        None => {}
-    }
-    _def_max_tick(current_tick, buy)
-}
-
-struct Watcher {
-    canister_id: Principal,
-}
-
-impl Watcher {
-    pub fn init(canister_id: Principal) -> Self {
-        return Watcher { canister_id };
-    }
-
-    pub fn store_tick_order(&self, tick: Tick, user: ID) {
-        let _ = ic_cdk::notify(self.canister_id, "storeTickOrder", (tick, user));
-    }
-
-    pub fn execute_ticks_orders(&self, ticks: Vec<Tick>) {
-        let _ = ic_cdk::notify(self.canister_id, "executeTicksOrders", (ticks,));
-    }
-}
-
-/// The Vault type representing vault canister that stores asset for the entire protocol
-/// it facilitates all movement of assets including collection and repayment of debt utilised for leverage
-
-#[derive(Clone, Copy)]
-struct Vault {
-    canister_id: Principal,
-    asset_id: Principal,
-}
-
-impl Vault {
-    // initialises the vault canister
-    pub fn init(canister_id: Principal, asset_id: Principal) -> Self {
-        Vault {
-            canister_id,
-            asset_id,
+        None => {
+            if buy {
+                return current_tick + _percentage64(DEFAULT_SWAP_SLIPPAGE, current_tick);
+            } else {
+                return current_tick - _percentage64(DEFAULT_SWAP_SLIPPAGE, current_tick);
+            }
         }
     }
+    return _def_max_tick(current_tick, buy);
+}
 
-    /// Update Assets Details function
-    ///
-    /// Updates the details of the particular asset
-    /// utlised when paying debt ,updating debt on a particular asset
-    pub fn update_asset_details(
-        &self,
-        new_debt: Option<Amount>,
-        amount_received: Amount,
-        interest: Amount,
-    ) {
-        if new_debt == None && amount_received == 0 && interest == 0 {
-            return; // returns without sending any message
+///
+fn _get_market_details() -> MarketDetails {
+    MARKET_DETAILS.with(|ref_market_details| ref_market_details.borrow().get().clone())
+}
+///
+///
+fn _get_state_details() -> StateDetails {
+    STATE_DETAILS.with(|ref_state_detaills| *ref_state_detaills.borrow().get())
+}
+///
+fn _update_state_details(new_state: StateDetails) {
+    STATE_DETAILS.with(|ref_state_details| ref_state_details.borrow_mut().set(new_state).unwrap());
+}
+
+/// Get Account Position
+///
+/// Returns Account Position or Panics if account has no position
+fn _get_account_position(account: &Subaccount) -> PositionDetails {
+    ACCOUNTS_POSITION
+        .with(|ref_position_details| ref_position_details.borrow().get(&account).unwrap())
+}
+///
+///
+/// Insert Account Position
+///
+/// Insert's New position for Account ,utilised when opening or updating a position
+fn _insert_account_position(account: Subaccount, position: PositionDetails) {
+    ACCOUNTS_POSITION
+        .with(|ref_users_position| ref_users_position.borrow_mut().insert(account, position));
+}
+///
+///
+fn _remove_account_position(account: &Subaccount) {
+    ACCOUNTS_POSITION.with(|ref_user_position| ref_user_position.borrow_mut().remove(account));
+}
+
+/// Get Account Error Log
+///
+/// Get's account's error log
+fn _get_account_error_log(account: &Subaccount) -> PositionUpdateErrorLog {
+    ACCOUNTS_ERROR_LOGS.with_borrow(|reference| reference.get(account).unwrap())
+}
+
+/// Insert Account Error
+///
+/// Insert's user error log ,User error log occurs during faled inter canister calls to repay debt and increase user's margin balance
+fn _insert_account_error_log(account: Subaccount, error_log: PositionUpdateErrorLog) {
+    ACCOUNTS_ERROR_LOGS.with_borrow_mut(|reference| reference.insert(account, error_log));
+}
+
+fn _remove_account_error_log(account: &Subaccount) {
+    ACCOUNTS_ERROR_LOGS.with_borrow_mut(|reference| reference.remove(account));
+}
+///
+/// Has No Position Or Pending Error Log
+///
+/// This function checks that an acccount currently has no opened position or any pending error log
+fn _has_position_or_pending_error_log(account: &Subaccount) -> bool {
+    ACCOUNTS_POSITION.with_borrow(|reference| reference.contains_key(account))
+        || ACCOUNTS_ERROR_LOGS.with_borrow(|reference| reference.contains_key(account))
+}
+///
+///Calculate Position Realised value
+///
+///Calculates the Realised value for a position's volume share in a particular market direction,Long or Short   
+///
+/// Note:This function also adjust's the volume share
+fn _calc_position_realised_val(volume_share: Amount, long: bool) -> Amount {
+    FUNDING_RATE_TRACKER.with_borrow_mut(|tr| {
+        let mut funding_rate_tracker = tr.get().clone();
+        //
+        let value = funding_rate_tracker.remove_volume(volume_share, long);
+        //
+        tr.set(funding_rate_tracker).unwrap();
+        value
+    })
+}
+
+///
+/// Calculate Position Volume Share
+///
+/// Calculates the volume share for a particular poistion volume in a market direction ,Long or Short
+fn _calc_position_volume_share(position_value: Amount, long: bool) -> Amount {
+    FUNDING_RATE_TRACKER.with_borrow_mut(|tr| {
+        let mut funding_rate_tracker = tr.get().clone();
+        //
+        let value = funding_rate_tracker.add_volume(position_value, long);
+        //
+        tr.set(funding_rate_tracker).unwrap();
+        value
+    })
+}
+///
+/// Calculate Position PNL
+///
+/// Calculates the current pnl in percentage  for a particular position
+fn _calculate_position_pnl(position: PositionDetails) -> i128 {
+    let equivalent = |amount: Amount, tick: Tick, buy: bool| {
+        let tick_price = _tick_to_price(tick);
+        _equivalent(amount, tick_price, buy)
+    };
+
+    let state_details = _get_state_details();
+
+    let position_realised_value = _calc_position_realised_val(position.volume_share, position.long);
+
+    if position.long {
+        let init_position_value = (position.debt_value + position.collateral_value) as i128;
+
+        let position_realised_size = equivalent(position_realised_value, position.entry_tick, true);
+
+        let position_current_value =
+            equivalent(position_realised_size, state_details.current_tick, false) as i128;
+
+        let fee = _calc_interest(
+            position.debt_value,
+            position.interest_rate,
+            position.timestamp,
+        ) as i128;
+
+        return ((position_current_value - fee - init_position_value)
+            * (100 * _ONE_PERCENT as i128))
+            / init_position_value;
+    } else {
+        let init_position_size = equivalent(
+            position.debt_value + position.collateral_value,
+            position.entry_tick,
+            true,
+        ) as i128;
+
+        let debt_size = equivalent(position.debt_value, position.entry_tick, true);
+
+        let fee = _calc_interest(debt_size, position.interest_rate, position.timestamp) as i128;
+
+        let position_current_size =
+            equivalent(position_realised_value, state_details.current_tick, true) as i128;
+
+        return ((position_current_size - fee - init_position_size) * (100 * _ONE_PERCENT as i128))
+            / init_position_size;
+    }
+}
+
+/// Settle Funcding Rate
+///
+/// Settles Funding Rate by calling the XRC cansiter .fetching the Price ,calculating the premium and distributing the  fund to the right market direction,Long or Short
+async fn settle_funding_rate() {
+    let market_details = _get_market_details();
+
+    let xrc = XRC::init(market_details.xrc_id);
+
+    let request = GetExchangeRateRequest {
+        base_asset: market_details.base_asset,
+        quote_asset: market_details.quote_asset,
+        timestamp: None,
+    };
+
+    match xrc._get_exchange_rate(request).await {
+        Ok(rate_result) => {
+            let state_details = _get_state_details();
+
+            let current_price = _tick_to_price(state_details.current_tick);
+
+            let perp_price =
+                (current_price * 10u128.pow(rate_result.metadata.decimals)) / _BASE_PRICE;
+
+            let spot_price = rate_result.rate as u128;
+
+            _settle_funding_rate(perp_price, spot_price);
         }
-        let _ = ic_cdk::notify(
-            self.canister_id,
-            "updatedPosition",
-            (self.asset_id, new_debt, amount_received, interest),
-        );
-    }
-
-    /// Borrow Liquidity functiion
-    ///
-    /// Borrows liquidty from vault to utilise as leverage for opening position
-    /// returns true is vault contains that amount of free liquidity or false otherwise
-    pub async fn borrow_liquidty(&self, amount: Amount) -> bool {
-        if amount == 0 {
-            return true;
-        };
-        let (val,) = ic_cdk::call(self.canister_id, "lock_liquidity", (amount,))
-            .await
-            .unwrap();
-
-        return val;
-    }
-
-    /// Send Asset in Function
-    ///
-    /// removes asset from user's account
-    ///
-    /// returns true if user has sufficient amount and false otherwise
-    pub async fn send_asset_in(&self, amount: Amount) -> bool {
-        let (val,) = ic_cdk::call(self.canister_id, "send_asset_in", (amount,))
-            .await
-            .unwrap();
-        return val;
-    }
-
-    /// Send Asset Out Function
-    ///
-    /// send asset to user's account
-    pub fn send_asset_out(&self, amount: Amount) {
-        if amount == 0 {
+        Err(_) => {
             return;
-        };
-        let _ = ic_cdk::notify(self.canister_id, "send_asset_out", (amount,));
+        }
     }
 }
 
-type Time = u64;
-type Amount = u128;
-type Tick = u64;
+fn _settle_funding_rate(perp_price: u128, spot_price: u128) {
+    let funding_rate = _calculate_funding_rate_premium(perp_price, spot_price);
+    FUNDING_RATE_TRACKER.with_borrow_mut(|reference| {
+        let mut funding_rate_tracker = reference.get().clone();
 
-#[derive(CandidType, Deserialize, Clone)]
-enum PositionType {
-    Market,
-    Order(TradeOrder),
+        funding_rate_tracker.settle_funding_rate(funding_rate.abs() as u64, funding_rate > 0);
+
+        reference.set(funding_rate_tracker).unwrap();
+    })
 }
 
-#[derive(CandidType, Deserialize, Clone)]
+fn _calculate_funding_rate_premium(perp_price: u128, spot_price: u128) -> i64 {
+    let funding_rate = ((perp_price as i128 - spot_price as i128) * 100 * _ONE_PERCENT as i128)
+        / spot_price as i128;
+    return funding_rate as i64;
+}
+
+/////////////////////////////////////////
+/// System Functions
+////////////////////////////////////////
+#[ic_cdk::pre_upgrade]
+fn pre_upgrade() {
+    let multiplier_bitmaps =
+        INTEGRAL_BITMAPS.with_borrow(|ref_mul_bitmaps| ref_mul_bitmaps.clone());
+    //
+    let ticks_details = TICKS_DETAILS.with_borrow(|ref_ticks_details| ref_ticks_details.clone());
+    //
+    storage::stable_save((multiplier_bitmaps, ticks_details)).expect("error storing data");
+}
+
+#[ic_cdk::post_upgrade]
+fn post_upgrade() {
+    let multiplier_bitmaps: HashMap<u64, u128>;
+
+    let ticks_details: HashMap<Tick, TickDetails>;
+    (multiplier_bitmaps, ticks_details) = storage::stable_restore().unwrap();
+    INTEGRAL_BITMAPS.with(|ref_mul_bitmaps| *ref_mul_bitmaps.borrow_mut() = multiplier_bitmaps);
+
+    TICKS_DETAILS.with(|ref_ticks_details| {
+        *ref_ticks_details.borrow_mut() = ticks_details;
+    })
+}
+
+//////////////////////////////////////////
+/// Admin Functions
+/////////////////////////////////////////
+///
+fn admin_guard() -> Result<(), String> {
+    ADMIN.with_borrow(|admin_ref| {
+        let admin = admin_ref.get();
+        if ic_cdk::caller() == admin.principal_id {
+            return Ok(());
+        } else {
+            return Err("Invalid".to_string());
+        };
+    })
+}
+
+#[ic_cdk::update(guard = "admin_guard", name = "updateStateDetails")]
+async fn update_state_details(new_state_details: StateDetails) {
+    _update_state_details(new_state_details);
+}
+
+#[ic_cdk::update(guard = "admin_guard", name = "startTimer")]
+async fn start_timer() {
+    ic_cdk_timers::set_timer_interval(Duration::from_secs(3600), || {
+        ic_cdk::spawn(async { settle_funding_rate().await });
+    });
+}
+
+/////////////////////////
+///  Error Handling Functions
+///////////////////////
+fn trusted_canister_guard() -> Result<(), String> {
+    let market_details = _get_market_details();
+
+    let caller = ic_cdk::caller();
+
+    if caller == market_details.vault_id || caller == market_details.watcher_id {
+        return Ok(());
+    } else {
+        return Err("Untrusted Caller".to_string());
+    }
+}
+
+#[ic_cdk::update(name = "retryError")]
+async fn retry_error(index: usize) {
+    let error = ERRORS.with_borrow(|reference| reference.get(index).unwrap().clone());
+
+    let details = _get_market_details();
+    //
+    match error {
+        ErrorType::ExecuteTicksOrderError(err) => err.retry(details),
+        ErrorType::StoreTickOrderError(err) => err.retry(details),
+        ErrorType::RemoveTickOrderError(err) => err.retry(details),
+    };
+}
+
+#[ic_cdk::update(name = "retryAccountError")]
+async fn retry_account_error(user: Principal) {
+    let account = user._to_subaccount();
+
+    let account_error_log = _get_account_error_log(&account);
+
+    let details = _get_market_details();
+    account_error_log.retry(details);
+}
+
+#[ic_cdk::update(name = "successNotification", guard = "trusted_canister_guard")]
+async fn success_notif(account: Subaccount, error_index: usize) {
+    let market_details = _get_market_details();
+
+    let caller = ic_cdk::caller();
+
+    if caller == market_details.vault_id {
+        _remove_account_error_log(&account);
+        return;
+    }
+
+    if caller == market_details.watcher_id {
+        ERRORS.with_borrow_mut(|reference| reference.remove(error_index));
+    }
+}
+
+//
+
+#[derive(CandidType, Deserialize, Debug, Serialize, Clone, Copy)]
+enum OrderType {
+    Market,
+    Limit,
+}
+
+#[derive(CandidType, Deserialize, Debug, Serialize, Clone, Copy)]
+enum PositionOrderType {
+    Market,
+    Limit(LimitOrder),
+}
+
+#[derive(CandidType, Deserialize, Debug, Clone, Copy)]
 struct PositionDetails {
     /// Entry Tick
     ///
@@ -871,7 +1270,7 @@ struct PositionDetails {
     /// the amount borrowed as leveragex10
     ///
     /// Note:debt is in perp Asset when shorting and in collateral_value asset when longing
-    debt: Amount,
+    debt_value: Amount,
     // /// PositionDetails Size
     // ///
     // /// The amount of asset in position
@@ -891,9 +1290,9 @@ struct PositionDetails {
     /// Current interest rate for opening a position with margin
     ///
     interest_rate: u32,
-    ///PositionDetails Type
+    ///Order Type
     ///
-    ///Posittion type can either be a
+    ///Position Order  type can either be a
     ///
     /// Market
     ///  - This is when position is opened instantly at the current price
@@ -901,7 +1300,7 @@ struct PositionDetails {
     /// Order
     ///   - This comprises of an order set at a particular tick and position is only opened when
     ///   that  order has been executed
-    position_type: PositionType,
+    order_type: PositionOrderType,
 
     /// TimeStamp
     ///
@@ -925,10 +1324,331 @@ impl Storable for PositionDetails {
 impl BoundedStorable for PositionDetails {
     const IS_FIXED_SIZE: bool = true;
 
-    const MAX_SIZE: u32 = 90;
+    const MAX_SIZE: u32 = 200;
+}
+
+//
+/// ManageDebtParams is utilised to handle debt handling and  repayment
+
+#[derive(Copy, Clone, Default, Deserialize, CandidType)]
+struct ManageDebtParams {
+    new_debt: Amount,
+    initial_debt: Amount,
+    interest_received: Amount,
+}
+
+impl ManageDebtParams {
+    fn init(new_debt: Amount, initial_debt: Amount, interest_received: Amount) -> Self {
+        ManageDebtParams {
+            new_debt,
+            initial_debt,
+            interest_received,
+        }
+    }
+}
+
+/////////////////////////////
+///   Possible error during inter canister calls and retry api
+////////////////////////////
+
+/// Retrying Trait
+///
+/// Trait for all Errors related to inter canister calls
+trait Retrying {
+    /// Retry  Function
+    ///
+    /// This is used to retry the  failed inter canister call
+    fn retry(&self, details: MarketDetails);
+}
+
+/// ManageDebtError
+///
+/// This error occurs for failed intercanister calls
+
+#[derive(Clone, Copy, Deserialize, CandidType)]
+struct PositionUpdateErrorLog {
+    user: Principal,
+    profit: Amount,
+    debt_params: ManageDebtParams,
+}
+impl Retrying for PositionUpdateErrorLog {
+    fn retry(&self, details: MarketDetails) {
+        let _ = ic_cdk::notify(
+            details.vault_id,
+            "managePositionUpdate",
+            (self.user, self.profit, self.debt_params),
+        );
+    }
+}
+
+impl Storable for PositionUpdateErrorLog {
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        Decode!(bytes.as_ref(), Self).unwrap()
+    }
+
+    fn to_bytes(&self) -> Cow<[u8]> {
+        Cow::Owned(Encode!(self).unwrap())
+    }
+}
+
+impl BoundedStorable for PositionUpdateErrorLog {
+    const IS_FIXED_SIZE: bool = true;
+
+    const MAX_SIZE: u32 = 130;
+}
+
+#[derive(Clone)]
+enum ErrorType {
+    ExecuteTicksOrderError(ExecuteTicksError),
+    StoreTickOrderError(StoreTickOrderError),
+    RemoveTickOrderError(RemoveTickOrderError),
+}
+
+#[derive(Clone)]
+struct ExecuteTicksError {
+    ticks: Vec<Tick>,
+}
+
+impl Retrying for ExecuteTicksError {
+    fn retry(&self, details: MarketDetails) {
+        let _ = ic_cdk::notify(
+            details.watcher_id,
+            "executeTicksOrders",
+            (self.ticks.clone(),),
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StoreTickOrderError {
+    account: Subaccount,
+    tick: Tick,
+}
+
+impl Retrying for StoreTickOrderError {
+    fn retry(&self, details: MarketDetails) {
+        let _ = ic_cdk::notify(
+            details.watcher_id,
+            "storeTicksOrder
+            ",
+            (self.account, self.tick),
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RemoveTickOrderError {
+    account: Subaccount,
+    tick: Tick,
+}
+
+impl Retrying for RemoveTickOrderError {
+    fn retry(&self, details: MarketDetails) {
+        let _ = ic_cdk::notify(
+            details.watcher_id,
+            "removeTickOrder",
+            (self.account, self.tick),
+        );
+    }
+}
+
+/// Exchange Rate Canister
+///
+/// Utilised for fetching the price of current exchnage rate (spot price) of the market pair
+
+struct XRC {
+    canister_id: Principal,
+}
+
+impl XRC {
+    fn init(canister_id: Principal) -> Self {
+        XRC { canister_id }
+    }
+
+    /// tries to fetche the current exchange rate of the pair and returns the result
+    async fn _get_exchange_rate(&self, request: GetExchangeRateRequest) -> GetExchangeRateResult {
+        if let Ok((rate_result,)) = ic_cdk::api::call::call_with_payment128(
+            self.canister_id,
+            "get_exchange_rate",
+            (request,),
+            1_000_000_000,
+        )
+        .await
+        {
+            return rate_result;
+        } else {
+            panic!()
+        }
+    }
+}
+
+///
+/// Watcher type
+///
+/// Represents the Watcher canister
+///
+/// The Watcher Canister helps in execution of positions with limit order type  by converting them to market order when the order's reference tick has been closed  
+
+struct Watcher {
+    canister_id: Principal,
+}
+
+impl Watcher {
+    pub fn init(canister_id: Principal) -> Self {
+        return Watcher { canister_id };
+    }
+
+    /// Store Tick Order
+    ///
+    /// Stores an order under a particular tick
+    ///
+    /// Utilised when positions are opened as limit orders
+    ///
+    ///
+    /// - Tick    :The tickat which order is placed
+    /// - Account : The account opening the position
+
+    pub fn store_tick_order(&self, tick: Tick, account: Subaccount) {
+        if let Ok(()) = ic_cdk::notify(self.canister_id, "storeTickOrder", (tick, account)) {
+        } else {
+            ERRORS.with_borrow_mut(|reference| {
+                let error = ErrorType::StoreTickOrderError(StoreTickOrderError { account, tick });
+                reference.push(error);
+            })
+        }
+    }
+
+    /// Remove Tick Order
+    ///
+    /// Removes an order under a particular tick
+    ///
+    /// Utilised when account owner closes a limit position before reference tick is fully crossed
+    ///
+    /// - Tick    :The tickat which order was placed
+    /// - Account : The account closing the position
+
+    pub fn remove_tick_order(&self, tick: Tick, account: Subaccount) {
+        if let Ok(()) = ic_cdk::notify(self.canister_id, "removeTickOrder", (tick, account)) {
+        } else {
+            ERRORS.with_borrow_mut(|reference| {
+                let error = ErrorType::RemoveTickOrderError(RemoveTickOrderError { account, tick });
+                reference.push(error);
+            })
+        }
+    }
+
+    /// Execute Ticks Orders
+    ///
+    /// Notifies Watcher to execute all orders placed at those tick respectively
+    ///
+    /// Ticks:  An array of ticks crossed during the swap (meaning all orders at those tick has been filled)
+
+    pub fn execute_ticks_orders(&self, ticks: Vec<Tick>) {
+        if ticks.len() == 0 {
+            return;
+        };
+
+        if let Ok(()) = ic_cdk::notify(self.canister_id, "executeTicksOrders", (ticks.clone(),)) {
+        } else {
+            ERRORS.with_borrow_mut(|reference| {
+                let error = ErrorType::ExecuteTicksOrderError(ExecuteTicksError { ticks });
+                reference.push(error);
+            })
+        }
+    }
+}
+
+/// The Vault type representing vault canister that stores asset for the entire collateral's denominated market
+/// it facilitates all movement of assets including collection and repayment of debt utilised for leverage
+
+#[derive(Clone, Copy)]
+struct Vault {
+    canister_id: Principal,
+}
+
+impl Vault {
+    // initialises the vault canister
+    pub fn init(canister_id: Principal) -> Self {
+        Vault { canister_id }
+    }
+
+    /// Manage Position Update
+    ///
+    /// Utilised when position is updated or closed
+    /// Utilised when for updating user_balance,repayment of debt
+    pub fn manage_position_update(
+        &self,
+        user: Principal,
+        profit: Amount,
+        manage_debt_params: ManageDebtParams,
+    ) {
+        if let Ok(()) = ic_cdk::notify(
+            self.canister_id,
+            "managePositionUpdate",
+            (user, profit, manage_debt_params),
+        ) {
+        } else {
+            let error_log = PositionUpdateErrorLog {
+                user,
+                profit,
+                debt_params: manage_debt_params,
+            };
+            _insert_account_error_log(user._to_subaccount(), error_log);
+        }
+    }
+
+    /// Create Position Validity Check
+    ///
+    /// Checks if position can be opened by checking that uswer has sufficient balance and amount to use as debt is available as free liquidity
+    ///
+    /// User:The Owner of Account that opened position
+    /// Collateral Delta:The Amount of asset used as collateral for opening position
+    /// Debt : The Amount of asset taken as debt
+    ///
+    /// Note :After checking that the condition holds ,the user balance is reduced by collateral amount and the free liquidity available is reduced by debt amount
+
+    pub async fn create_position_validity_check(
+        &self,
+        user: Principal,
+        collateral: Amount,
+        debt: Amount,
+    ) -> (bool, u32) {
+        if let Ok((valid, interest_rate)) = ic_cdk::call(
+            self.canister_id,
+            "createPositionValidityCheck",
+            (user, collateral, debt),
+        )
+        .await
+        {
+            return (valid, interest_rate);
+        } else {
+            return (false, 0);
+        }
+    }
+}
+
+trait UniqueSubAccount {
+    const NONCE: u8;
+    fn _to_subaccount(&self) -> Subaccount;
+}
+
+impl UniqueSubAccount for Principal {
+    const NONCE: u8 = 1;
+    fn _to_subaccount(&self) -> Subaccount {
+        let mut hasher = Sha256::new();
+        hasher.update(self.as_slice());
+        hasher.update(&Principal::NONCE.to_be_bytes());
+        let hash = hasher.finalize();
+        let mut subaccount = [0u8; 32];
+        subaccount.copy_from_slice(&hash[..32]);
+        subaccount
+    }
 }
 
 export_candid!();
 
 pub mod corelib;
 pub mod types;
+
+#[cfg(test)]
+pub mod integration_tests;
