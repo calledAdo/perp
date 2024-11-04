@@ -24,6 +24,6 @@ dist/
 # environment variables
 .env
 
-/src/xrc
+src/xrc/
 
-/src/perp/pocket-ic
+src/perp/pocket-ic
