@@ -236,7 +236,7 @@ impl<'a> SwapParams<'a> {
         // tick details
         let tick_details = match self.ticks_details.get_mut(&tick_params.tick) {
             Some(res) => res,
-            None => return { (amount_out, amount_remaining, false) },
+            None => return (amount_out, amount_remaining, false),
         };
 
         let init_tick_liq = tick_details.liq_bounds_token1._liquidity_within();
@@ -339,7 +339,7 @@ mod test {
 
             let order_size = 100_000;
 
-            let (amount_out, amount_remaining, resulting_tick, crossed_ticks) =
+            let (amount_out, amount_remaining, resulting_tick, _crossed_ticks) =
                 _swap(order_size, false, swapping_tick, 220_00_000);
 
             assert_eq!(amount_out, order_size * 2); //trade was executed at 200 percent

@@ -37,7 +37,7 @@ mod unit_test {
 
         let amount_to_swap = 1_000_000_000;
         // swap_at_tick
-        let (amount_out, amount_remaining, resulting_tick, crossed_ticks) = _swap(
+        let (amount_out, _amount_remaining, _resulting_tick, _crossed_ticks) = _swap(
             amount_to_swap,
             false,
             230 * constants::_ONE_PERCENT,
