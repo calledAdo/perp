@@ -2,8 +2,9 @@ use candid::{CandidType, Deserialize, Principal};
 
 use sha2::{Digest, Sha256};
 
+use core_lib::staking::{StakeDetails, StakeSpan};
 use std::cell::RefCell;
-use types::{StakeDetails, StakeSpan, Token, VaultDetails};
+use types::VaultDetails;
 
 type Amount = u128;
 type Time = u64;
@@ -18,7 +19,7 @@ type Memory = VirtualMemory<DefaultMemoryImpl>;
 
 const _VAULT_DETAILS_MEMORY: MemoryId = MemoryId::new(1);
 const _USERS_STAKES_DETAILS_MEMORY: MemoryId = MemoryId::new(2);
-const _USERS_BALANCE_MEMORY: MemoryId = MemoryId::new(3);
+const _USERS_MARGIN_BALANCE_MEMORY: MemoryId = MemoryId::new(3);
 
 thread_local! {
 
@@ -32,7 +33,7 @@ thread_local! {
 
     static USERS_MARGIN_BALANCE :RefCell<StableBTreeMap<Subaccount,Amount,Memory>> = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with_borrow(|reference|{
-        reference.get(_USERS_BALANCE_MEMORY)
+        reference.get(_USERS_MARGIN_BALANCE_MEMORY)
     })));
 
 
@@ -140,8 +141,11 @@ async fn fund_margin_account(amount: Amount, for_principal: Principal) {
 
     let account = ic_cdk::caller()._to_subaccount();
 
-    let token = Token::init(vault_details.asset.principal_id);
-    if token.move_asset(amount, Some(account), None).await {
+    let token = vault_details.asset;
+    if token
+        .move_asset(amount, ic_cdk::id(), Some(account), None)
+        .await
+    {
         let receiver = for_principal._to_subaccount();
         _update_user_margin_balance(receiver, amount, true);
     }
@@ -168,9 +172,9 @@ async fn withdraw_from_margin_account(amount: Amount) {
         return;
     }
 
-    let token = Token::init(vault_details.asset.principal_id);
+    let token = vault_details.asset;
     if token
-        .move_asset(amount_to_withdraw - tx_fee, None, Some(user))
+        .move_asset(amount_to_withdraw - tx_fee, ic_cdk::id(), None, Some(user))
         .await
     {
         _update_user_margin_balance(user, amount_to_withdraw, false);
@@ -194,16 +198,24 @@ async fn provide_leverage(amount: Amount) {
 
     assert!(amount >= vault_details.min_amount);
 
-    let token = Token::init(vault_details.asset.principal_id);
+    let token = vault_details.asset;
 
-    if !(token.move_asset(amount, Some(user), None).await) {
+    if !(token
+        .move_asset(amount, ic_cdk::id(), Some(user), None)
+        .await)
+    {
         return;
     }
 
-    let vtoken = Token::init(vault_details.virtaul_asset.principal_id);
+    let vtoken = vault_details.virtaul_asset;
     // minting asset to user
-    if !(vtoken.move_asset(amount, None, Some(user)).await) {
-        token.move_asset(amount, None, Some(user)).await;
+    if !(vtoken
+        .move_asset(amount, ic_cdk::id(), None, Some(user))
+        .await)
+    {
+        token
+            .move_asset(amount, ic_cdk::id(), None, Some(user))
+            .await;
         return;
     }
     vault_details.free_liquidity += amount;
@@ -233,20 +245,28 @@ async fn remove_leverage(amount: Amount) {
         return;
     }
 
-    let vtoken = Token::init(vault_details.virtaul_asset.principal_id);
+    let vtoken = vault_details.virtaul_asset;
     // minting asset to user
-    if !vtoken.move_asset(amount, Some(user), None).await {
+    if !vtoken
+        .move_asset(amount, ic_cdk::id(), Some(user), None)
+        .await
+    {
         return;
     }
 
-    let token = Token::init(vault_details.asset.principal_id);
+    let token = vault_details.asset;
 
     let tx_fee = vault_details.tx_fee;
 
-    if !(token.move_asset(amount - tx_fee, None, Some(user)).await) {
+    if !(token
+        .move_asset(amount - tx_fee, ic_cdk::id(), None, Some(user))
+        .await)
+    {
         // if asset can't e sent back
         // mint back
-        vtoken.move_asset(amount, None, Some(user)).await;
+        vtoken
+            .move_asset(amount, ic_cdk::id(), None, Some(user))
+            .await;
         return;
     }
 
@@ -268,11 +288,11 @@ async fn stake(amount: Amount, stake_span: StakeSpan) {
 
     assert!(amount >= vault_details.min_amount);
 
-    let vtoken = Token::init(vault_details.virtaul_asset.principal_id);
+    let vtoken = vault_details.virtaul_asset;
     // send in asset from user to account
     assert!(
         vtoken
-            .move_asset(amount, Some(user), Some(_vault_subaccount()))
+            .move_asset(amount, ic_cdk::id(), Some(user), Some(_vault_subaccount()))
             .await
     );
 
@@ -301,10 +321,15 @@ async fn unstake(stake_timestamp: Time) -> Result<Amount, String> {
         .staking_details
         ._close_stake(ref_stake, vault_details.lifetime_fees);
 
-    let vtoken = Token::init(vault_details.virtaul_asset.principal_id);
+    let vtoken = vault_details.virtaul_asset;
 
     if !(vtoken
-        .move_asset(amount_out, Some(_vault_subaccount()), Some(user))
+        .move_asset(
+            amount_out,
+            ic_cdk::id(),
+            Some(_vault_subaccount()),
+            Some(user),
+        )
         .await)
     {
         return Err("failed".to_string());
@@ -390,4 +415,5 @@ fn _vault_subaccount() -> Subaccount {
     return canister_id._to_subaccount();
 }
 
+pub mod core_lib;
 pub mod types;

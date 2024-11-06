@@ -469,14 +469,20 @@ fn _open_position(
                 return None;
             }
 
-            let (unused_collateral_value, unused_debt_value);
-
             // the amount remaining value to be refunded to
             let amount_remaining_value = if long {
                 amount_remaining
             } else {
                 equivalent(amount_remaining, current_tick, false)
             };
+
+            let position_value = if long {
+                collateral_value + debt_value - amount_remaining_value
+            } else {
+                amount_out
+            };
+
+            let (unused_collateral_value, unused_debt_value);
 
             if amount_remaining_value >= debt_value {
                 unused_debt_value = debt_value;
@@ -489,10 +495,7 @@ fn _open_position(
             let resulting_debt_value = debt_value - unused_debt_value;
             let resulting_collateral_value = collateral_value - unused_collateral_value;
 
-            let volume_share = _calc_position_volume_share(
-                collateral_value + debt_value - amount_remaining_value,
-                long,
-            );
+            let volume_share = _calc_position_volume_share(position_value, long);
 
             position = PositionDetails {
                 long,
@@ -511,6 +514,117 @@ fn _open_position(
     _insert_account_position(account, position);
 
     return Some(open_position_result);
+}
+
+fn _open_market_long_position(
+    account: Subaccount,
+    long: bool,
+    collateral_value: Amount,
+    debt_value: Amount,
+    interest_rate: u32,
+    current_tick: Tick,
+    max_tick: Tick,
+) -> Option<(PositionDetails, Tick, Vec<Tick>)> {
+    let (collateral, debt) = (collateral_value, debt_value);
+
+    let (amount_out, amount_remaining_value, resulting_tick, crossed_ticks) =
+        _swap(collateral + debt, long, current_tick, max_tick);
+
+    if amount_out == 0 {
+        return None;
+    }
+
+    let position_value = collateral_value + debt_value - amount_remaining_value;
+
+    let (unused_collateral_value, unused_debt_value);
+
+    if amount_remaining_value >= debt_value {
+        unused_debt_value = debt_value;
+        unused_collateral_value = amount_remaining_value - debt_value
+    } else {
+        unused_debt_value = amount_remaining_value;
+        unused_collateral_value = 0
+    }
+
+    let resulting_debt_value = debt_value - unused_debt_value;
+    let resulting_collateral_value = collateral_value - unused_collateral_value;
+
+    let volume_share = _calc_position_volume_share(position_value, long);
+
+    let position = PositionDetails {
+        long,
+        entry_tick: resulting_tick,
+        collateral_value: resulting_collateral_value,
+        debt_value: resulting_debt_value, //actual debt
+        interest_rate,
+        volume_share,
+        order_type: PositionOrderType::Market,
+        timestamp: ic_cdk::api::time(), //change to time()
+    };
+    _insert_account_position(account, position);
+
+    return Some((position, resulting_tick, crossed_ticks));
+}
+
+fn _open_market_short_position(
+    account: Subaccount,
+    long: bool,
+    collateral_value: Amount,
+    debt_value: Amount,
+    interest_rate: u32,
+    current_tick: Tick,
+    max_tick: Tick,
+) -> Option<(PositionDetails, Tick, Vec<Tick>)> {
+    let equivalent = |amount: Amount, tick: Tick, buy: bool| -> Amount {
+        let tick_price = _tick_to_price(tick);
+        _equivalent(amount, tick_price, buy)
+    };
+    let (collateral, debt) = (
+        equivalent(collateral_value, current_tick, true),
+        equivalent(debt_value, current_tick, true),
+    );
+
+    // swap is executed
+
+    let (amount_out, amount_remaining, resulting_tick, crossed_ticks) =
+        _swap(collateral + debt, long, current_tick, max_tick);
+
+    if amount_out == 0 {
+        return None;
+    }
+
+    // the amount remaining value to be refunded to
+    let amount_remaining_value = equivalent(amount_remaining, current_tick, false);
+
+    let position_value = amount_out;
+
+    let (unused_collateral_value, unused_debt_value);
+
+    if amount_remaining_value >= debt_value {
+        unused_debt_value = debt_value;
+        unused_collateral_value = amount_remaining - debt_value
+    } else {
+        unused_debt_value = amount_remaining_value;
+        unused_collateral_value = 0
+    }
+
+    let resulting_debt_value = debt_value - unused_debt_value;
+    let resulting_collateral_value = collateral_value - unused_collateral_value;
+
+    let volume_share = _calc_position_volume_share(position_value, long);
+
+    let position = PositionDetails {
+        long,
+        entry_tick: resulting_tick,
+        collateral_value: resulting_collateral_value,
+        debt_value: resulting_debt_value, //actual debt
+        interest_rate,
+        volume_share,
+        order_type: PositionOrderType::Market,
+        timestamp: ic_cdk::api::time(), //change to time()
+    };
+    _insert_account_position(account, position);
+    return Some((position, resulting_tick, crossed_ticks));
 }
 
 /// Close Long PositionDetails
